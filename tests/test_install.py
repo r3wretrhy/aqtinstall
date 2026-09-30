@@ -2006,3 +2006,33 @@ def test_installer_passes_base_to_metadatafactory(
         sys.stderr.write(err)
 
         assert expect_out.match(err), err
+
+
+def test_is_extractable_zip_rejects_7z_suffix_even_if_is_zipfile(tmp_path, monkeypatch):
+    """Qt .7z archives can false-positive zipfile.is_zipfile on CPython < 3.14 (#1042)."""
+    from aqt.installer import _is_extractable_zip
+
+    archive = tmp_path / "qtbase-linux-arm64.7z"
+    archive.write_bytes(b"not-a-real-archive")
+    monkeypatch.setattr("aqt.installer.zipfile.is_zipfile", lambda p: True)
+    assert _is_extractable_zip(archive) is False
+
+
+def test_is_extractable_zip_rejects_7z_magic(tmp_path, monkeypatch):
+    from aqt.installer import _is_extractable_zip
+
+    archive = tmp_path / "oddly-named.zip"
+    archive.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 20)
+    monkeypatch.setattr("aqt.installer.zipfile.is_zipfile", lambda p: True)
+    assert _is_extractable_zip(archive) is False
+
+
+def test_is_extractable_zip_accepts_real_zip(tmp_path):
+    import zipfile as zf
+
+    from aqt.installer import _is_extractable_zip
+
+    archive = tmp_path / "payload.zip"
+    with zf.ZipFile(archive, "w") as z:
+        z.writestr("hello.txt", "hi")
+    assert _is_extractable_zip(archive) is True
