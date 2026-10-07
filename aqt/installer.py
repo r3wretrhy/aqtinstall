@@ -83,6 +83,9 @@ try:
 except ImportError:
     EXT7Z = True
 
+# 7z signature header ("7z\xbc\xaf\x27\x1c")
+SEVENZIP_SIGNATURE = b"7z\xbc\xaf\x27\x1c"
+
 
 class BaseArgumentParser(argparse.ArgumentParser):
     """Global options and subcommand trick"""
@@ -1629,24 +1632,20 @@ def init_worker_sh() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
+def _is_7zfile(archive: Path) -> bool:
+    """Return True if *archive* starts with the 7z signature header.
 
-def _is_extractable_zip(archive: Path) -> bool:
-    """Return True if *archive* should be opened with ``zipfile``.
-
-    Some Qt ``.7z`` packages false-positive ``zipfile.is_zipfile`` on CPython
-    before 3.14 (python/cpython#72680). Prefer an explicit ``.7z`` suffix or
-    the 7z magic header over ``is_zipfile`` so extraction uses py7zr/external
-    7z instead of raising ``BadZipFile`` (see #1042).
+    py7zr is optional (an external ``7z`` binary may be used instead), so we
+    cannot rely on ``py7zr.is_7zfile``. Checking the signature explicitly also
+    lets us test for 7z before ``zipfile.is_zipfile``, which can report false
+    positives for some Qt ``.7z`` packages on CPython before 3.14
+    (python/cpython#72680, see #1042).
     """
-    if archive.suffix.lower() == ".7z":
-        return False
     try:
         with open(archive, "rb") as fh:
-            if fh.read(6) == b"7z\xbc\xaf\x27\x1c":
-                return False
+            return fh.read(len(SEVENZIP_SIGNATURE)) == SEVENZIP_SIGNATURE
     except OSError:
-        pass
-    return zipfile.is_zipfile(archive)
+        return False
 
 
 def installer(
@@ -1701,20 +1700,25 @@ def installer(
                 # remove this when the minimum Python version is 3.12
                 logger.warning("Extracting may be unsafe; consider updating Python to 3.11.4 or greater")
                 tar_archive.extractall(path=base_dir)
-    elif _is_extractable_zip(archive):
+    elif _is_7zfile(archive):
+        if command is None:
+            with py7zr.SevenZipFile(archive, "r") as szf:
+                szf.extractall(path=base_dir)
+        else:
+            command_args = [command, "x", "-aoa", "-bd", "-y", "-o{}".format(base_dir), str(archive)]
+            try:
+                proc = subprocess.run(command_args, capture_output=True, check=True, text=True)
+                logger.debug(proc.stdout)
+            except subprocess.CalledProcessError as cpe:
+                msg = "\n".join(filter(None, [f"Extraction error: {cpe.returncode}", cpe.stdout, cpe.stderr]))
+                raise ArchiveExtractionError(msg) from cpe
+    elif zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as zip_archive:
             zip_archive.extractall(path=base_dir)
-    elif command is None:
-        with py7zr.SevenZipFile(archive, "r") as szf:
-            szf.extractall(path=base_dir)
     else:
-        command_args = [command, "x", "-aoa", "-bd", "-y", "-o{}".format(base_dir), str(archive)]
-        try:
-            proc = subprocess.run(command_args, capture_output=True, check=True, text=True)
-            logger.debug(proc.stdout)
-        except subprocess.CalledProcessError as cpe:
-            msg = "\n".join(filter(None, [f"Extraction error: {cpe.returncode}", cpe.stdout, cpe.stderr]))
-            raise ArchiveExtractionError(msg) from cpe
+        raise ArchiveExtractionError(
+            f"Unable to extract '{archive.name}': unrecognized archive format (expected tar, 7z or zip)"
+        )
     if not keep:
         os.unlink(archive)
     logger.info("Finished installation of {} in {:.8f}".format(archive.name, time.perf_counter() - start_time))
